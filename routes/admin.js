@@ -243,4 +243,27 @@ router.get('/assinaturas', authAdmin, async (req, res) => {
   } catch (e) { res.status(500).json({ erro: e.message }); }
 });
 
+// POST /admin/alterar-senha
+router.post('/alterar-senha', authAdmin, async (req, res) => {
+  try {
+    const { senha_atual, nova_senha } = req.body;
+    if (!senha_atual || !nova_senha)
+      return res.status(400).json({ erro: 'Campos obrigatórios.' });
+    if (nova_senha.length < 6)
+      return res.status(400).json({ erro: 'Nova senha deve ter ao menos 6 caracteres.' });
+
+    const { data: admin } = await db
+      .from('admins').select('*')
+      .eq('id', req.admin.id).maybeSingle();
+
+    if (!admin || !bcrypt.compareSync(senha_atual, admin.senha_hash))
+      return res.status(401).json({ erro: 'Senha atual incorreta.' });
+
+    const nova_hash = bcrypt.hashSync(nova_senha, 10);
+    await db.from('admins').update({ senha_hash: nova_hash }).eq('id', req.admin.id);
+
+    res.json({ mensagem: 'Senha alterada com sucesso.' });
+  } catch (e) { res.status(500).json({ erro: e.message }); }
+});
+
 module.exports = router;
