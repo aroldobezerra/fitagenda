@@ -11,6 +11,28 @@ function token(payload) {
   return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '8h' });
 }
 
+// ── Gera username a partir do nome ────────────────────────
+function gerarUsername(nome) {
+  return nome
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')  // remove acentos
+    .replace(/[^a-z0-9]/g, '')        // só letras e números
+    .slice(0, 30);                     // máx 30 chars
+}
+
+// ── Garante username único (adiciona número se necessário) ─
+async function usernameUnico(base) {
+  let username = base;
+  let tentativa = 1;
+  while (true) {
+    const { data } = await db.from('personals').select('id').eq('username', username).maybeSingle();
+    if (!data) return username;
+    username = `${base}${tentativa}`;
+    tentativa++;
+  }
+}
+
 // POST /auth/personal/register
 router.post('/personal/register', async (req, res) => {
   try {
@@ -21,10 +43,14 @@ router.post('/personal/register', async (req, res) => {
     const { data: existe } = await db.from('personals').select('id').eq('email', email.toLowerCase()).maybeSingle();
     if (existe) return res.status(409).json({ erro: 'E-mail já cadastrado.' });
 
+    // Gera username automático baseado no nome
+    const usernameBase = gerarUsername(nome.trim());
+    const username     = await usernameUnico(usernameBase);
+
     const senha_hash = bcrypt.hashSync(senha, 10);
     const { data: p, error } = await db.from('personals')
-      .insert({ nome: nome.trim(), email: email.toLowerCase().trim(), senha_hash, telefone: telefone || null, especialidade: especialidade || null })
-      .select('id,nome,email,telefone,especialidade,plano')
+      .insert({ nome: nome.trim(), email: email.toLowerCase().trim(), senha_hash, telefone: telefone || null, especialidade: especialidade || null, username })
+      .select('id,nome,email,telefone,especialidade,plano,username')
       .single();
 
     if (error) throw error;
@@ -48,7 +74,7 @@ router.post('/personal/login', async (req, res) => {
     }
 
     const t = token({ id: p.id, nome: p.nome, email: p.email, role: 'personal', personal_id: p.id });
-    res.json({ token: t, usuario: { id: p.id, nome: p.nome, email: p.email, telefone: p.telefone, especialidade: p.especialidade, plano: p.plano, role: 'personal' } });
+    res.json({ token: t, usuario: { id: p.id, nome: p.nome, email: p.email, telefone: p.telefone, especialidade: p.especialidade, plano: p.plano, username: p.username, role: 'personal' } });
   } catch (e) {
     res.status(500).json({ erro: e.message });
   }
@@ -166,12 +192,90 @@ router.get('/me', authMiddleware, async (req, res) => {
   try {
     const { id, role, personal_id } = req.user;
     if (role === 'personal') {
-      const { data } = await db.from('personals').select('id,nome,email,telefone,especialidade,plano,created_at').eq('id', id).maybeSingle();
+      const { data } = await db.from('personals').select('id,nome,email,telefone,especialidade,plano,username,created_at').eq('id', id).maybeSingle();
       return res.json({ ...data, role: 'personal' });
     }
     const { data: a } = await db.from('alunos').select('id,nome,email,telefone,created_at').eq('id', id).maybeSingle();
     const { data: p } = await db.from('personals').select('nome').eq('id', personal_id).maybeSingle();
     res.json({ ...a, role: 'aluno', personal_id, personal_nome: p?.nome });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// ── PATCH /auth/personal/username — altera username ───────
+router.patch('/personal/username', authMiddleware, soPersonal, async (req, res) => {
+  try {
+    const { username } = req.body;
+    if (!username) return res.status(400).json({ erro: 'Username obrigatório.' });
+
+    const limpo = username.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9_]/g, '').slice(0, 30);
+    if (limpo.length < 3) return res.status(400).json({ erro: 'Username deve ter ao menos 3 caracteres.' });
+
+    // Verifica se já está em uso por outro personal
+    const { data: existe } = await db.from('personals').select('id').eq('username', limpo).maybeSingle();
+    if (existe && existe.id !== req.user.personal_id)
+      return res.status(409).json({ erro: 'Este username já está em uso.' });
+
+    await db.from('personals').update({ username: limpo }).eq('id', req.user.personal_id);
+    res.json({ mensagem: 'Username atualizado.', username: limpo });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// ── GET /auth/p/:username — perfil público do personal ────
+router.get('/p/:username', async (req, res) => {
+  try {
+    const { data: p } = await db.from('personals')
+      .select('id,nome,especialidade,username')
+      .eq('username', req.params.username.toLowerCase())
+      .eq('ativo', true)
+      .maybeSingle();
+
+    if (!p) return res.status(404).json({ erro: 'Personal não encontrado.' });
+    res.json({ personal: p });
+  } catch (e) {
+    res.status(500).json({ erro: e.message });
+  }
+});
+
+// ── POST /auth/entrar/:username — aluno se cadastra via link público ──
+router.post('/entrar/:username', async (req, res) => {
+  try {
+    const { nome, email, telefone, senha } = req.body;
+    if (!nome || !email || !senha) return res.status(400).json({ erro: 'nome, email e senha obrigatórios.' });
+    if (senha.length < 6) return res.status(400).json({ erro: 'Senha mínimo 6 caracteres.' });
+
+    // Busca personal pelo username
+    const { data: p } = await db.from('personals')
+      .select('id,nome')
+      .eq('username', req.params.username.toLowerCase())
+      .eq('ativo', true)
+      .maybeSingle();
+
+    if (!p) return res.status(404).json({ erro: 'Personal não encontrado.' });
+
+    const emailNorm = email.toLowerCase().trim();
+
+    // Verifica se aluno já existe com este personal
+    const { data: existe } = await db.from('alunos')
+      .select('id').eq('personal_id', p.id).eq('email', emailNorm).maybeSingle();
+    if (existe) return res.status(409).json({ erro: 'E-mail já cadastrado com este personal.' });
+
+    const senha_hash = bcrypt.hashSync(senha, 10);
+    const { data: aluno, error } = await db.from('alunos')
+      .insert({ personal_id: p.id, nome: nome.trim(), email: emailNorm, telefone: telefone || null, senha_hash })
+      .select('id,nome,email,telefone,personal_id').single();
+
+    if (error) throw error;
+
+    const t = token({ id: aluno.id, nome: aluno.nome, email: aluno.email, role: 'aluno', personal_id: aluno.personal_id });
+    res.status(201).json({
+      mensagem: 'Conta criada!',
+      token: t,
+      usuario: { ...aluno, role: 'aluno', personal_nome: p.nome }
+    });
   } catch (e) {
     res.status(500).json({ erro: e.message });
   }
